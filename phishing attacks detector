@@ -1,0 +1,144 @@
+import os
+import base64
+import json
+import re
+import requests
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from bs4 import BeautifulSoup
+
+# Gmail API Scopes
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+# Google Safe Browsing API Key (or PhishTank API)
+SAFE_BROWSING_API_KEY = 'YOUR_GOOGLE_SAFE_BROWSING_API_KEY'  # You can get it from Google Developer Console
+
+# Function to authenticate and get Gmail service
+def authenticate_gmail():
+    """Authenticate to Gmail API and get service instance."""
+    creds = None
+    if os.path.exists('token.json'):
+        creds = None
+        with open('token.json', 'r') as token:
+            creds = json.load(token)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        with open('token.json', 'w') as token:
+            json.dump(creds.to_json(), token)
+    
+    service = build('gmail', 'v1', credentials=creds)
+    return service
+
+# Function to get unread messages from Gmail
+def get_messages(service, query='is:unread'):
+    """Retrieve messages from Gmail inbox based on query."""
+    results = service.users().messages().list(userId='me', q=query).execute()
+    messages = results.get('messages', [])
+    return messages
+
+# Function to fetch email details and content
+def get_email_details(service, msg_id):
+    """Retrieve the email content by message ID."""
+    message = service.users().messages().get(userId='me', id=msg_id).execute()
+    payload = message['payload']
+    
+    headers = payload['headers']
+    for header in headers:
+        if header['name'] == 'From':
+            sender = header['value']
+        if header['name'] == 'Subject':
+            subject = header['value']
+    
+    # Extract body
+    parts = payload.get('parts', [])
+    body = ""
+    for part in parts:
+        try:
+            body += base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+        except KeyError:
+            continue
+
+    return sender, subject, body
+
+# Function to detect suspicious URLs using Google Safe Browsing API
+def check_url_safety(url):
+    """Check the safety of a URL using Google Safe Browsing API."""
+    endpoint = f'https://safebrowsing.googleapis.com/v4/threatMatches:find?key={SAFE_BROWSING_API_KEY}'
+    request_data = {
+        "client": {
+            "clientId": "your-client-id",
+            "clientVersion": "1.0"
+        },
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}]
+        }
+    }
+    response = requests.post(endpoint, json=request_data)
+    response_json = response.json()
+
+    if 'matches' in response_json:
+        return True  # URL is unsafe
+    return False  # URL is safe
+
+# Function to extract URLs from email content
+def extract_urls_from_email(content):
+    """Extract all URLs from email content using regex."""
+    urls = re.findall(r'(https?://[^\s]+)', content)
+    return urls
+
+# Function to detect phishing attempts in emails
+def detect_phishing_in_email(service, msg_id):
+    """Detect phishing attempts in an email by checking URLs and content."""
+    sender, subject, body = get_email_details(service, msg_id)
+    
+    # Check if the sender is suspicious (e.g., mismatched domains)
+    if 'gmail.com' not in sender:
+        print(f"Suspicious sender: {sender}")
+    
+    # Check for suspicious subject lines
+    if "urgent" in subject.lower() or "account" in subject.lower():
+        print(f"Suspicious subject: {subject}")
+    
+    # Extract URLs from the email body
+    urls = extract_urls_from_email(body)
+    
+    # Check if any URLs are unsafe using Google Safe Browsing
+    for url in urls:
+        is_safe = check_url_safety(url)
+        if not is_safe:
+            print(f"Suspicious URL detected: {url}")
+            return True  # Phishing detected
+    
+    return False
+
+# Main function to check for phishing emails
+def main():
+    # Authenticate and create a service instance
+    service = authenticate_gmail()
+    
+    # Get unread emails
+    messages = get_messages(service)
+    
+    if not messages:
+        print('No new messages.')
+    else:
+        print('Checking emails for phishing...')
+        for message in messages:
+            msg_id = message['id']
+            if detect_phishing_in_email(service, msg_id):
+                print(f"Phishing email detected! Message ID: {msg_id}")
+            else:
+                print(f"Safe email detected! Message ID: {msg_id}")
+
+if __name__ == '__main__':
+    main()
